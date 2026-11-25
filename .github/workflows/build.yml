@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  APP_VERSION: "1.0.0.0"
+  IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME || 'TechSolutions.SKPDFCompressor' }}
+  PUBLISHER: ${{ vars.MSIX_PUBLISHER || 'CN=TechSolutions' }}
+  PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY || 'Tech Solutions' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt pyinstaller reportlab numpy
+      - name: Icons
+        run: python make_icons.py
+      - name: Self-test
+        run: python selftest.py
+      - name: Build EXE
+        run: pyinstaller --noconfirm --onefile --windowed --name "SK PDF Compressor" --icon app.ico --add-data "app.ico;." --collect-all tkinterdnd2 --distpath dist/onefile app.py
+      - name: Build folder app for MSIX
+        run: pyinstaller --noconfirm --windowed --name "SK PDF Compressor" --icon app.ico --add-data "app.ico;." --collect-all tkinterdnd2 --distpath dist/folder --workpath build/folder app.py
+      - name: Build MSIX
+        shell: pwsh
+        run: |
+          $stage = "msix_stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse "dist/folder/SK PDF Compressor" "$stage/SKPDFCompressor"
+          Copy-Item -Recurse "Assets" "$stage/Assets"
+          (Get-Content AppxManifest.xml -Raw) `
+            -replace '__IDENTITY_NAME__', $env:IDENTITY_NAME `
+            -replace '__PUBLISHER_DISPLAY__', $env:PUBLISHER_DISPLAY `
+            -replace '__PUBLISHER__', $env:PUBLISHER `
+            -replace '__VERSION__', $env:APP_VERSION |
+            Set-Content "$stage/AppxManifest.xml" -Encoding UTF8
+          $makeappx = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          & $makeappx.FullName pack /d $stage /p "SK_PDF_Compressor_$($env:APP_VERSION)_x64.msix" /o
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SK-PDF-Compressor-EXE
+          path: dist/onefile/SK PDF Compressor.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SK-PDF-Compressor-MSIX
+          path: "*.msix"
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/onefile/SK PDF Compressor.exe
+            *.msix
