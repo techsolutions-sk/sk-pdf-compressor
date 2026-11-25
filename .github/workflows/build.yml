@@ -12,6 +12,7 @@ env:
   PUBLISHER: ${{ vars.MSIX_PUBLISHER || 'CN=TechSolutions' }}
   PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY || 'Tech Solutions' }}
 
+permissions: {contents: write}
 jobs:
   build:
     runs-on: windows-latest
