@@ -37,26 +37,6 @@ TARGETS = [
     ("10 MB", 10 * 1024 * 1024),
 ]
 
-# Image quality ladder: (max DPI, JPEG quality, label). Tried from top to
-# bottom; the first level that fits the target size wins.
-LEVELS = [
-    (1200, 97, "Maximum (native resolution)"),
-    (300, 95, "Original-like (300 DPI)"),
-    (300, 90, "Excellent (300 DPI)"),
-    (250, 88, "Excellent (250 DPI)"),
-    (220, 85, "Very high (220 DPI)"),
-    (200, 82, "Very high (200 DPI)"),
-    (180, 80, "High (180 DPI)"),
-    (150, 80, "High (150 DPI)"),
-    (150, 72, "Good (150 DPI)"),
-    (130, 70, "Good (130 DPI)"),
-    (110, 65, "Screen (110 DPI)"),
-    (96, 60, "Screen (96 DPI)"),
-    (85, 55, "Small (85 DPI)"),
-    (72, 50, "Smallest (72 DPI)"),
-]
-
-
 @dataclass
 class Result:
     ok: bool
@@ -163,84 +143,128 @@ def _iter_images(pdf: pikepdf.Pdf):
         yield from walk(page.obj.get(Name.Resources), inches)
 
 
-def _optimise_image(obj: pikepdf.Object, page_inches: float, dpi: int, quality: int) -> None:
-    if obj.get(Name.ImageMask, False):
-        return
-    bpc = int(obj.get(Name.BitsPerComponent, 8))
-    if bpc == 1:
-        return  # 1-bit scans (CCITT/JBIG2) are already tiny & sharp
-    filt = obj.get(Name.Filter)
-    filters = [str(f) for f in filt] if isinstance(filt, pikepdf.Array) else [str(filt)] if filt else []
-    if any(f in ("/JBIG2Decode", "/CCITTFaxDecode", "/JPXDecode") for f in filters):
-        return
+def _dpi_q(s: float):
+    """Quality knob s in [0,1] -> (max DPI, JPEG quality). Higher = better & bigger."""
+    dpi = int(50 * (12 ** s))          # 50 .. 600 DPI
+    q = int(round(30 + 70 * s))        # 30 .. 100
+    return dpi, q
 
-    w, h = int(obj.Width), int(obj.Height)
-    if w * h < 64 * 64:
-        return  # icons / tiny images: leave untouched
 
-    try:
-        pil = PdfImage(obj).as_pil_image()
-    except Exception:
-        return
+class _Img:
+    __slots__ = ("obj", "inches", "pil", "gray", "w", "h", "raw_len", "cache", "keep", "boost")
 
-    if pil.mode in ("1", "P", "LA", "PA", "RGBA", "I", "I;16", "F"):
-        pil = pil.convert("L" if pil.mode in ("1", "LA", "I", "I;16", "F") else "RGB")
-    gray = pil.mode == "L"
-    if pil.mode not in ("L", "RGB"):
-        pil = pil.convert("RGB")
 
-    max_px = int(page_inches * dpi)
-    scale = min(1.0, max_px / max(w, h))
-    if scale < 0.98:
-        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-
-    buf = io.BytesIO()
-    pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True,
-             subsampling=0 if quality >= 88 else 2)
-    data = buf.getvalue()
-
-    old_len = len(obj.read_raw_bytes())
-    if len(data) >= old_len and scale >= 0.98:
-        return  # never make an image bigger
-
-    obj.write(data, filter=Name.DCTDecode)
-    obj.Width, obj.Height = pil.size
-    obj.ColorSpace = Name.DeviceGray if gray else Name.DeviceRGB
-    obj.BitsPerComponent = 8
-    for k in (Name.DecodeParms, Name.Decode):
-        if k in obj:
-            del obj[k]
-
-    # Resize soft mask (transparency) to match, losslessly.
-    smask = obj.get(Name.SMask)
-    if smask is not None and scale < 0.98:
+def _collect(pdf: pikepdf.Pdf):
+    items = []
+    for obj, inches in list(_iter_images(pdf)):
         try:
-            m = PdfImage(smask).as_pil_image().convert("L")
-            m = m.resize(pil.size, Image.LANCZOS)
-            smask.write(zlib.compress(m.tobytes(), 9), filter=Name.FlateDecode)
-            smask.Width, smask.Height = m.size
-            smask.BitsPerComponent = 8
-            smask.ColorSpace = Name.DeviceGray
-            if Name.DecodeParms in smask:
-                del smask[Name.DecodeParms]
-        except Exception:
-            del obj[Name.SMask]
-
-
-def _build_level(src: str, dst: str, dpi: int, quality: int) -> int:
-    with pikepdf.open(src) as pdf:
-        _lossless_cleanup(pdf)
-        for obj, inches in list(_iter_images(pdf)):
-            try:
-                _optimise_image(obj, inches, dpi, quality)
-            except Exception:
+            if obj.get(Name.ImageMask, False) or int(obj.get(Name.BitsPerComponent, 8)) == 1:
                 continue
+            filt = obj.get(Name.Filter)
+            fl = [str(f) for f in filt] if isinstance(filt, pikepdf.Array) else [str(filt)] if filt else []
+            if any(f in ("/JBIG2Decode", "/CCITTFaxDecode", "/JPXDecode") for f in fl):
+                continue
+            w, h = int(obj.Width), int(obj.Height)
+            if w * h < 64 * 64:
+                continue
+            pil = PdfImage(obj).as_pil_image()
+            if pil.mode not in ("L", "RGB"):
+                pil = pil.convert("L" if pil.mode in ("1", "LA", "I", "I;16", "F") else "RGB")
+            it = _Img()
+            it.obj, it.inches, it.pil, it.gray = obj, inches, pil, pil.mode == "L"
+            it.w, it.h, it.raw_len, it.cache, it.keep, it.boost = w, h, len(obj.read_raw_bytes()), {}, False, False
+            items.append(it)
+        except Exception:
+            continue
+    return items
+
+
+def _encode(it: _Img, s: float):
+    """Return (jpeg_bytes or None to keep original, new_size)."""
+    if it.keep:
+        return (None, (it.w, it.h))
+    if it.boost:
+        s = 1.0
+    dpi, q = _dpi_q(s)
+    max_px = int(it.inches * dpi)
+    scale = min(1.0, max_px / max(it.w, it.h))
+    if scale >= 0.98:
+        scale = 1.0
+    size = (max(1, int(it.w * scale)), max(1, int(it.h * scale)))
+    key = (size, q)
+    if key in it.cache:
+        return it.cache[key]
+    pil = it.pil if scale == 1.0 else it.pil.resize(size, Image.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, "JPEG", quality=q, optimize=True, progressive=True,
+             subsampling=0 if q >= 100 else 2)
+    data = buf.getvalue()
+    res = (None, size) if (scale == 1.0 and len(data) >= it.raw_len) else (data, size)
+    it.cache.clear()
+    it.cache[key] = res
+    return res
+
+
+def _estimate(items, overhead: int, s: float) -> int:
+    total = overhead
+    for it in items:
+        data, _ = _encode(it, s)
+        total += it.raw_len if data is None else len(data)
+    return total
+
+
+def _apply(src_path: str, dst: str, s: float, keep=frozenset(), boost=frozenset()) -> int:
+    with pikepdf.open(src_path) as pdf:
+        for idx, it in enumerate(_collect(pdf)):
+            it.keep = idx in keep
+            it.boost = idx in boost
+            data, size = _encode(it, s)
+            if data is None:
+                continue
+            obj = it.obj
+            obj.write(data, filter=Name.DCTDecode)
+            obj.Width, obj.Height = size
+            obj.ColorSpace = Name.DeviceGray if it.gray else Name.DeviceRGB
+            obj.BitsPerComponent = 8
+            for k in (Name.DecodeParms, Name.Decode):
+                if k in obj:
+                    del obj[k]
+            smask = obj.get(Name.SMask)
+            if smask is not None and size != (it.w, it.h):
+                try:
+                    m = PdfImage(smask).as_pil_image().convert("L").resize(size, Image.LANCZOS)
+                    smask.write(zlib.compress(m.tobytes(), 9), filter=Name.FlateDecode)
+                    smask.Width, smask.Height = size
+                    smask.BitsPerComponent = 8
+                    smask.ColorSpace = Name.DeviceGray
+                    if Name.DecodeParms in smask:
+                        del smask[Name.DecodeParms]
+                except Exception:
+                    del obj[Name.SMask]
         return _save(pdf, dst)
+
+
+def _label(s: float) -> str:
+    dpi, q = _dpi_q(s)
+    if s >= 0.85:
+        name = "Original-like"
+    elif s >= 0.65:
+        name = "Excellent"
+    elif s >= 0.45:
+        name = "Very high"
+    elif s >= 0.3:
+        name = "High"
+    else:
+        name = "Good"
+    return f"{name} (up to {min(dpi, 600)} DPI, {q}% JPEG)"
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+FILL = 0.985  # aim for 98.5% of the chosen size (e.g. 1 MB -> ~1000 KB, never above)
+
+
 def compress(
     src: str,
     dst: str,
@@ -254,60 +278,116 @@ def compress(
     in_size = os.path.getsize(src)
     tmpdir = tempfile.mkdtemp(prefix="skpdf_")
     try:
-        report(5, "Lossless optimisation…")
+        report(5, "Cleaning up PDF (lossless)...")
         lossless = os.path.join(tmpdir, "lossless.pdf")
         with pikepdf.open(src) as pdf:
             _lossless_cleanup(pdf)
             size = _save(pdf, lossless)
-
         best_path, best_size = (lossless, size) if size < in_size else (src, in_size)
 
         if best_size <= target_bytes:
             shutil.copyfile(best_path, dst)
-            return Result(True, in_size, best_size, target_bytes, "lossless",
-                          "100% original quality", dst,
-                          "No quality change at all — only internal data cleaned up.")
-
-        # Binary search over the quality ladder for the best level that fits.
-        lo, hi = 0, len(LEVELS) - 1
-        found = None
-        tried = {}
-        step = 0
-        total_steps = max(1, len(LEVELS).bit_length() + 1)
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            dpi, q, label = LEVELS[mid]
-            step += 1
-            report(10 + int(80 * step / total_steps), f"Trying {label}…")
-            out = os.path.join(tmpdir, f"lvl{mid}.pdf")
-            s = _build_level(src, out, dpi, q)
-            tried[mid] = (out, s)
-            if s <= target_bytes:
-                found = mid
-                hi = mid - 1  # try a better quality
-            else:
-                lo = mid + 1
-
-        if found is not None:
-            out, s = tried[found]
-            shutil.copyfile(out, dst)
             report(100, "Done")
-            return Result(True, in_size, s, target_bytes, "image-optimized",
-                          LEVELS[found][2], dst,
-                          "Text & fonts untouched; images kept at the highest quality that fits.")
+            msg = ("File is already smaller than the chosen size - kept 100% original quality."
+                   if in_size <= target_bytes else
+                   "Fits without touching any pixel - 100% original quality.")
+            return Result(True, in_size, best_size, target_bytes, "lossless",
+                          "100% original quality", dst, msg)
 
-        # Could not reach the target: give the smallest we managed.
-        smallest_idx = min(tried, key=lambda i: tried[i][1])
-        out, s = tried[smallest_idx]
-        if s >= best_size:
-            out, s = best_path, best_size
-        shutil.copyfile(out, dst)
+        report(12, "Reading images...")
+        with pikepdf.open(lossless) as pdf:
+            items = _collect(pdf)
+            overhead = size - sum(it.raw_len for it in items)
+            goal = int(target_bytes * FILL)
+
+            if not items or _estimate(items, overhead, 0.0) > target_bytes:
+                # Not enough images to shrink: give the smallest clean version.
+                out = os.path.join(tmpdir, "min.pdf")
+                s_min = _apply(lossless, out, 0.0) if items else best_size
+                if items and s_min < best_size:
+                    best_path, best_size = out, s_min
+                shutil.copyfile(best_path, dst)
+                report(100, "Done")
+                return Result(False, in_size, best_size, target_bytes, "best-possible",
+                              _label(0.0) if items else "100% original quality", dst,
+                              "This PDF is mostly text/fonts and cannot reach the chosen size "
+                              "without damaging them. Saved the smallest clean version.")
+
+            def search(ovh):
+                if _estimate(items, ovh, 1.0) <= goal:
+                    return 1.0
+                lo, hi = 0.0, 1.0
+                for _ in range(12):
+                    mid = (lo + hi) / 2
+                    if _estimate(items, ovh, mid) <= goal:
+                        lo = mid
+                    else:
+                        hi = mid
+                return lo
+
+            # Write, measure the real size, correct the estimate and repeat.
+            out = os.path.join(tmpdir, "out.pdf")
+            best = None
+            ovh = overhead
+            for attempt in range(4):
+                report(20 + attempt * 14, f"Finding best quality for {human(target_bytes)}...")
+                s = search(ovh)
+                keep, boost = set(), set()
+                # Spend leftover room: upgrade single images to max JPEG, then to original.
+                for it in items:
+                    it.keep = it.boost = False
+                est = _estimate(items, ovh, s)
+                def cost(i):
+                    it = items[i]
+                    return it.raw_len
+                for idx in sorted(range(len(items)), key=cost):
+                    it = items[idx]
+                    cur = len(_encode(it, s)[0] or b"") or it.raw_len
+                    if s < 1.0:
+                        it.boost = True
+                        up = len(_encode(it, 1.0)[0] or b"") or it.raw_len
+                        if est - cur + up <= goal:
+                            est, cur = est - cur + up, up
+                            boost.add(idx)
+                        else:
+                            it.boost = False
+                    if est - cur + it.raw_len <= goal:
+                        est += it.raw_len - cur
+                        keep.add(idx)
+                for it in items:
+                    it.keep = it.boost = False
+                cand = os.path.join(tmpdir, f"try{attempt}.pdf")
+                real = _apply(lossless, cand, s, frozenset(keep), frozenset(boost))
+                if real <= target_bytes and (best is None or real > best[0]):
+                    best = (real, cand, s, len(keep))
+                if real <= target_bytes and (real >= goal * 0.93 or s >= 1.0):
+                    break
+                # correct overhead by the estimation error and retry
+                for idx, it in enumerate(items):
+                    it.keep, it.boost = idx in keep, idx in boost
+                est = _estimate(items, ovh, s)
+                for it in items:
+                    it.keep = it.boost = False
+                ovh += real - est
+
+        if best is None:  # safety net: lowest quality
+            cand = os.path.join(tmpdir, "low.pdf")
+            best = (_apply(lossless, cand, 0.0), cand, 0.0, 0)
+        real, cand, s, kept = best
+        shutil.copyfile(cand, dst)
         report(100, "Done")
-        return Result(False, in_size, s, target_bytes, "best-possible",
-                      LEVELS[smallest_idx][2] if out != best_path else "100% original quality",
-                      dst,
-                      "This PDF cannot go below the chosen size without damaging text/fonts. "
-                      "Saved the smallest clean version.")
+        if kept and kept == len(items):
+            lbl = "100% original quality"
+        elif kept:
+            lbl = f"Original-like ({kept} image(s) untouched)"
+        else:
+            lbl = _label(s)
+        msg = "Text, fonts and lines untouched; images at the highest quality that fits."
+        if s >= 1.0 and real < goal * 0.9:
+            msg = ("Already at maximum image quality - it does not need the full "
+                   f"{human(target_bytes)}. Text and fonts untouched.")
+        return Result(real <= target_bytes, in_size, real, target_bytes, "image-optimized",
+                      lbl, dst, msg)
     except pikepdf.PasswordError:
         return Result(False, in_size, in_size, target_bytes, "error", "", dst,
                       "This PDF is password-protected. Please unlock it first.")
