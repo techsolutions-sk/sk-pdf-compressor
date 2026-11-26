@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  APP_VERSION: "1.0.0.0"
+  APP_VERSION: "1.1.0.0"
   IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME || 'TechSolutions.SKPDFCompressor' }}
   PUBLISHER: ${{ vars.MSIX_PUBLISHER || 'CN=TechSolutions' }}
   PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY || 'Tech Solutions' }}
@@ -27,6 +27,20 @@ jobs:
         run: python make_icons.py
       - name: Self-test
         run: python selftest.py
+      - name: UI screenshots
+        continue-on-error: true
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python ci_sample.py
+          New-Item -ItemType Directory -Force -Path shots | Out-Null
+          $env:SK_SCREENSHOT = "shots"
+          python app.py Invoice_Report_2026.pdf Scanned_Documents.pdf
+          Get-ChildItem shots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UI-Screenshots
+          path: shots/*.png
       - name: Build EXE
         run: pyinstaller --noconfirm --onefile --windowed --name "SK PDF Compressor" --icon app.ico --add-data "app.ico;." --collect-all tkinterdnd2 --distpath dist/onefile app.py
       - name: Build folder app for MSIX
@@ -61,3 +75,4 @@ jobs:
           files: |
             dist/onefile/SK PDF Compressor.exe
             *.msix
+            shots/*.png
